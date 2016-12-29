@@ -16,8 +16,8 @@ MINUTE 	= 2
 SECONDS = 3
 FRAME 	= 4
 
-# debug 时间流逝速度, 正常1.0
-TIME_ELAPSED = 0.001
+# debug 时间流逝速度, 正常1.0, 可以调小方便调试
+TIME_ELAPSED = 1.0 
 
 def get_seconds(hour, minute, seconds, frame):
 	return hour * 3600.0 + minute * 60.0 + seconds + frame / 30.0
