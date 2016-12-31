@@ -2,6 +2,8 @@
 __author__ = 'xscn2426'
 
 import time
+import random
+from Pool import Pool
 
 # 无限次数计时器
 FOREVER = -1
@@ -16,8 +18,8 @@ MINUTE 	= 2
 SECONDS = 3
 FRAME 	= 4
 
-# debug 时间流逝速度, 正常1.0, 可以调小方便调试
-TIME_ELAPSED = 1.0 
+# debug 时间流逝速度, 正常1.0
+TIME_ELAPSED = 0.001
 
 def get_seconds(hour, minute, seconds, frame):
 	return hour * 3600.0 + minute * 60.0 + seconds + frame / 30.0
@@ -46,9 +48,36 @@ def to_time(src, src_unit, dst_unit):
 	seconds = to_seconds(src, src_unit)
 	return seconds_to(seconds, dst_unit)
 
+class TimerId(object):
+	''' 计时器的id生成器 不允许外部初始化 '''
+	_inc = random.randint(0, 0xFFFFFF)
+
+	def __init__(self, wheel, slot):
+		super(TimerId, self).__init__()
+		self.wheel = wheel
+		self.slot = slot
+
+		self._id = TimerId._inc
+		self.time = time.time()
+
+		TimerId._inc = (TimerId._inc + 1) % 0xFFFFFF
+
+	def update_wheel_slot(self, wheel, slot):
+		self.wheel = wheel
+		self.slot = slot
+
+	def __hash__(self):
+		return hash((self._id, self.time))
+
+	def __eq__(self, other):
+		return self._id == other._id and self.time == other.time
+
 class Timer(object):
+	__metaclass__ = Pool
 
 	def __init__(self, create_time, rounds, callback, interval_rounds=0, interval_offset=0, times=1, remainder = 0, rremainder = 0):
+		self.id = 0
+
 		self.create_time = create_time
 		self.rounds	= rounds
 		self.callback = callback
@@ -59,6 +88,7 @@ class Timer(object):
 		self.rescheduleRounds = interval_rounds
 		self.rescheduleOffset = interval_offset
 		self.rescheduleRemainder = rremainder
+		self.timer_id = None
 
 	def cancelled(self):
 		return self.status == CANCELLED
@@ -95,65 +125,79 @@ class Timer(object):
 			if self.times != FOREVER:
 				self.times -= 1
 
+	def return_to_pool(self):
+		self.timer_id = None
+		self.callback = None
+
 class TimerSlot(object):
 
-	def __init__(self):
+	def __init__(self, time_unit):
 		super(TimerSlot, self).__init__()
-		self.timers = []		# timers
+		self.time_unit = time_unit
+		self.timers = {}		# timers
 
-	def add_delay_timer(self, create_time, rounds, callback, remainder = 0):
+	def add_delay_timer(self, create_time, rounds, callback, remainder = 0, slot_idx=0):
 		timer = Timer(create_time, rounds, callback, remainder = remainder)
-		self.timers.append(timer)
-		return timer
+		key = TimerId(self.time_unit, slot_idx)
+		self.timers[key] = timer
+		timer.timer_id = key
+		return key
 
-	def add_repeat_timer(self, create_time, rounds, callback, interval_rounds, interval_offset, times, remainder = 0, rremainder = 0):
+	def add_repeat_timer(self, create_time, rounds, callback, interval_rounds, interval_offset, times, remainder = 0, rremainder = 0, slot_idx=0):
 		timer = Timer(create_time, rounds, callback, interval_rounds, interval_offset, times, remainder=remainder, rremainder = rremainder)
-		self.timers.append(timer)
-		return timer
+		key = TimerId(self.time_unit, slot_idx)
+		self.timers[key] = timer
+		timer.timer_id = key
+		return key
 
-	def add_timer(self, timer):
-		self.timers.append(timer)
+	def add_timer(self, timer, slot_idx):
+		timer.timer_id.update_wheel_slot(self.time_unit, slot_idx)
+		self.timers[timer.timer_id] = timer
 
 	def process(self):
 		to_remove = []
 		to_reschedule = []
-		for timer in self.timers:
+		for key, timer in self.timers.iteritems():
 			if timer.cancelled():
-				to_remove.append(timer)
+				to_remove.append(key)
 			elif timer.ready():
 				timer.deal()
-				to_remove.append(timer)
+				to_remove.append(key)
 				if timer.can_reuse():
 					to_reschedule.append(timer)
 			else:
 				timer.decrement()
-		for t in to_remove:
-			self.timers.remove(t)
+		for key in to_remove:
+			del self.timers[key]
 		return to_reschedule
 
 	def hprocess(self):
 		to_remove = []
 		to_reschedule = []
 		to_lower = []
-		for timer in self.timers:
+		for key, timer in self.timers.iteritems():
 			if timer.cancelled():
-				to_remove.append(timer)
+				to_remove.append(key)
 			elif timer.ready():
 				timer.deal()
-				to_remove.append(timer)
+				to_remove.append(key)
 				if timer.can_reuse():
 					to_reschedule.append(timer)
 			elif timer.can_lower():
 				to_lower.append(timer)
-				to_remove.append(timer)
+				to_remove.append(key)
 			else:
 				timer.decrement()
-		for t in to_remove:
-			self.timers.remove(t)
+		for key in to_remove:
+			del self.timers[key]
 		return to_reschedule, to_lower
 
+	def cancel_id(self, timer_id):
+		if timer_id in self.timers:
+			self.timers[timer_id].cancel()
+
 	def clear(self):
-		for timer in self.timers:
+		for timer in self.timers.itervalues():
 			timer.cancel()
 
 class TimerWheel(object):
@@ -165,7 +209,7 @@ class TimerWheel(object):
 		self.resolution = resolution
 		self.wheels = []
 		for i in xrange(wheelSize):
-			self.wheels.append(TimerSlot())
+			self.wheels.append(TimerSlot(time_unit))
 
 		self.cursor = 0
 
@@ -175,27 +219,32 @@ class TimerWheel(object):
 	def delay_exec(self, delay, callback):
 		offset = int(delay / self.resolution)
 		rounds = int(offset / self.wheelSize)
-		self.wheels[self.idx(self.cursor + offset)].add_delay_timer(time.time(), rounds, callback)
+		slot_idx = self.idx(self.cursor + offset)
+		self.wheels[slot_idx].add_delay_timer(time.time(), rounds, callback, slot_idx=slot_idx)
 
 	def repeat_exec(self, delay, interval, times, callback):
 		offset = int(delay / self.resolution)
 		rounds = int(offset / self.wheelSize)
 		interval_offset = int(interval / self.resolution)
 		interval_rounds = int(interval / self.wheelSize)
-		self.wheels[self.idx(self.cursor + offset)].add_repeat_timer(time.time(), rounds, callback, interval_rounds, interval_offset, times)
+		slot_idx = self.idx(self.cursor + offset)
+		self.wheels[slot_idx].add_repeat_timer(time.time(), rounds, callback, interval_rounds, interval_offset, times, slot_idx=slot_idx)
 
 	def repeat_forever_exec(self, delay, interval, callback):
 		self.repeat_exec(delay, interval, FOREVER, callback)
 
 	def add_hierarchical_delay_timer(self, offset, rounds, remainder, callback):
-		return self.wheels[self.idx(self.cursor + offset)].add_delay_timer(time.time(), rounds, callback, remainder=remainder)
+		slot_idx = self.idx(self.cursor + offset)
+		return self.wheels[slot_idx].add_delay_timer(time.time(), rounds, callback, remainder=remainder, slot_idx=slot_idx)
 
 	def add_hierarchical_repeat_timer(self, offset, rounds, remainder, callback, roffset, rrounds, rremainder, times):
-		return self.wheels[self.idx(self.cursor + offset)].add_repeat_timer(time.time(), rounds, callback, rrounds, roffset, times, rremainder = rremainder, remainder=remainder)
+		slot_idx = self.idx(self.cursor + offset)
+		return self.wheels[slot_idx].add_repeat_timer(time.time(), rounds, callback, rrounds, roffset, times, rremainder = rremainder, remainder=remainder, slot_idx=slot_idx)
 
 	def reschedule(self, timer):
 		timer.reset()
-		self.wheels[self.idx(self.cursor + timer.get_offset())].add_timer(timer)
+		slot_idx = self.idx(self.cursor + timer.get_offset())
+		self.wheels[slot_idx].add_timer(timer, slot_idx=slot_idx)
 
 	def idx(self, cursor):
 		return int(cursor % self.wheelSize)
@@ -221,8 +270,6 @@ class TimerWheel(object):
 		if old_cursor + 1 == self.wheelSize and self.pre:
 			self.pre.update_cursor(timerWheel)
 			self.pre.expire(timerWheel)
-		if self == timerWheel.chain.hourWheel:
-			print "hour ", self.cursor
 
 	def expire(self, timerWheel):
 		slot = self.wheels[self.cursor]
@@ -242,7 +289,8 @@ class TimerWheel(object):
 	def hadd_timer(self, timer, offset=None):
 		if offset is None:
 			offset = timer.get_offset()
-		self.wheels[self.idx(self.cursor + offset)].add_timer(timer)
+		slot_idx = self.idx(self.cursor + offset)
+		self.wheels[slot_idx].add_timer(timer, slot_idx=slot_idx)
 
 	def clear(self):
 		for slot in self.wheels:
@@ -282,34 +330,14 @@ class HierarchicalTimerWheel(object):
 
 	def lower_timer(self, timer):
 		delay = timer.remainder
-		(dhour, hour_remainder), (dminute, minute_remainder), (dseconds, seconds_remainder), (dframes,_) = self.calc_param(delay)
-		if dhour:
-			rounds = int(dhour / 24)
-			if rounds == dhour / 24:
-				rounds -= 1
-			timer.remainder = hour_remainder
-			timer.rounds = rounds
-			self.chain.hourWheel.hadd_timer(timer, dhour)
-		elif dminute:
-			timer.remainder = minute_remainder
-			timer.rounds = 0
-			self.chain.minuteWheel.hadd_timer(timer, dminute)
-		elif dseconds:
-			timer.remainder = seconds_remainder
-			timer.rounds = 0
-			self.chain.secondsWheel.hadd_timer(timer, dseconds)
-		elif dframes:
-			timer.remainder = 0
-			timer.rounds = 0
-			self.chain.frameWheel.hadd_timer(timer, dframes)
-		else:
-			timer.remainder = 0
-			timer.rounds = 0
-			self.chain.frameWheel.hadd_timer(timer, 1)
+		self._reuse(delay, timer)
 
 	def reschedule(self, timer):
 		interval = timer.get_offset()
-		(dhour, hour_remainder), (dminute, minute_remainder), (dseconds, seconds_remainder), (dframes,_) = self.calc_param(interval)
+		self._reuse(interval, timer)
+
+	def _reuse(self, delay, timer):
+		(dhour, hour_remainder), (dminute, minute_remainder), (dseconds, seconds_remainder), (dframes,_) = self.calc_param(delay)
 		if dhour:
 			rounds = int(dhour / 24)
 			if rounds == dhour / 24:
@@ -370,6 +398,8 @@ class HierarchicalTimerWheel(object):
 		(dhour, hour_remainder), (dminute, minute_remainder), (dseconds, seconds_remainder), (dframes,_) = self.calc_param(delay)
 		if dhour:
 			rounds = int(dhour / 24)
+			if rounds == dhour / 24:
+				rounds -= 1
 			return self.chain.hourWheel.add_hierarchical_delay_timer(dhour, rounds, hour_remainder, callback)
 		elif dminute:
 			return self.chain.minuteWheel.add_hierarchical_delay_timer(dminute, 0, minute_remainder, callback)
@@ -388,6 +418,8 @@ class HierarchicalTimerWheel(object):
 		if dhour:
 			offset = dhour
 			rounds = int(dhour / 24)
+			if rounds == dhour / 24:
+				rounds -= 1
 			remainder = hour_remainder
 		elif dminute:
 			offset = dminute
@@ -421,6 +453,17 @@ class HierarchicalTimerWheel(object):
 		self.chain.secondsWheel.clear()
 		self.chain.frameWheel.clear()
 
+	def cancel_timer(self, timer_id):
+		wheel = timer_id.wheel
+		slot = timer_id.slot
+		if wheel == HOUR and 0 <= slot < len(self.chain.hourWheel.wheels):
+			self.chain.hourWheel.wheels[slot].cancel_id(timer_id)
+		elif wheel == MINUTE and 0 <= slot < len(self.chain.minuteWheel.wheels):
+			self.chain.minuteWheel.wheels[slot].cancel_id(timer_id)
+		elif wheel == SECONDS and 0 <= slot < len(self.chain.secondsWheel.wheels):
+			self.chain.secondsWheel.wheels[slot].cancel_id(timer_id)
+		elif wheel == FRAME and 0 <= slot < len(self.chain.frameWheel.wheels):
+			self.chain.frameWheel.wheels[slot].cancel_id(timer_id)
 
 
 wheel = HierarchicalTimerWheel()
@@ -435,27 +478,29 @@ wheel.delay_exec(30, lambda: cb(30))
 wheel.delay_exec(40, lambda: cb(40))
 wheel.delay_exec(50, lambda: cb(50))
 wheel.delay_exec(60, lambda: cb(60))
-wheel.delay_exec(70, lambda: cb(70))
 wheel.delay_exec(60, lambda: cb(60))
+wheel.delay_exec(70, lambda: cb(70))
 
 wheel.delay_exec(100, lambda: cb(100))
-wheel.delay_exec(100, lambda: cb(101))
+a =  wheel.delay_exec(100, lambda: cb(101))
 wheel.delay_exec(100, lambda: cb(102))
-#
-# wheel.repeat_exec(3700, 3700, 20, lambda: cb(25))
 
-# wheel.delay_exec(3600 * 25, lambda: cb(102))
 
-repeat_timer = wheel.repeat_exec(25, 24, 11, lambda: cb("every 2.2s"))
+#wheel.repeat_exec(3700, 3700, 20, lambda: cb(25))
+
+#a = wheel.delay_exec(3600, lambda: cb(102))
+
+repeat_timer = wheel.repeat_exec(25, 40, 200, lambda: cb("every 2.2s"))
 
 def cancel_cb():
-	#repeat_timer.cancel()
-	wheel.clear()
+	print 'cancel cb'
+	wheel.cancel_timer(a)
+	#wheel.clear()
 
-wheel.delay_exec(50, lambda :cancel_cb())
+wheel.delay_exec(80, lambda :cancel_cb())
 
 def delay_delay():
-	wheel.delay_exec(100, lambda: cb(4100))
+	wheel.delay_exec(1000, lambda: cb(4100))
 
 #wheel.delay_exec(4000, lambda: delay_delay())
 
