@@ -9,3 +9,4 @@
 timerwheel实现了一个类似 netty的不分层的时间轮。
 HierarchicalTimerWheel类实现了一个分成的时间轮。默认设置最小轮是游戏的帧，最大轮支持小时，并且支持rounds，理论上所有的timer都可以由其来实现。
 具体的信息见代码。
+增加缓存事件的功能，同时封闭玩家对timer的直接引用。
